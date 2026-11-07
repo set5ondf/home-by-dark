@@ -8,7 +8,6 @@ HomeByDark answers that. Give it a distance, climbing, and your curfew. It compu
 
 **New in v2:** hand it a GPX file instead (any Strava or Garmin export) and it reads the distance, climbing, date, and your actual start time out of the file. Run it on a past ride and it grades the ride you really did.
 
-Zero dependencies. Just Python 3.9+.
 
 ## Usage
 
