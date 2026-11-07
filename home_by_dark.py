@@ -21,10 +21,18 @@ Usage:
     python3 home_by_dark.py --distance 15 --gain 1150 --leave 16:10
     python3 home_by_dark.py --distance 22 --gain 1600 --week
     python3 home_by_dark.py --distance 30 --curfew 18:30 --speed 16 --stops 10
+
+Or hand it a GPX file (Strava / Garmin export) and skip the typing:
+    python3 home_by_dark.py --gpx my_ride.gpx
+Distance, climbing, the date, and even your actual start time are read
+from the file, so running it on a past ride gives a verdict on the ride
+you really did. --distance / --gain / --date / --leave still override
+whatever the file says.
 """
 
 import argparse
 import math
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -79,6 +87,67 @@ def ride_minutes(distance_mi, gain_ft, speed_mph, climb_min_per_100ft, stops_min
     return flat + climb + stops_min
 
 
+def haversine_mi(lat1, lon1, lat2, lon2):
+    r = 3958.8  # Earth radius, miles
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def local_name(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def parse_gpx(path, tz):
+    """Read distance (mi), elevation gain (ft) and start time from a GPX file.
+
+    Gain is summed from a 5-point moving average of the elevation track so
+    GPS noise does not inflate it. Returns a dict; start may be None if the
+    file has no timestamps.
+    """
+    root = ET.parse(path).getroot()
+    pts = []  # (lat, lon, ele_m, time)
+    for el in root.iter():
+        if local_name(el.tag) != "trkpt":
+            continue
+        lat, lon = float(el.get("lat")), float(el.get("lon"))
+        ele, tstamp = None, None
+        for child in el:
+            name = local_name(child.tag)
+            if name == "ele":
+                ele = float(child.text)
+            elif name == "time":
+                tstamp = child.text
+        pts.append((lat, lon, ele, tstamp))
+    if len(pts) < 2:
+        raise SystemExit(f"GPX file has fewer than 2 track points: {path}")
+
+    distance = sum(
+        haversine_mi(a[0], a[1], b[0], b[1]) for a, b in zip(pts, pts[1:])
+    )
+
+    eles = [p[2] for p in pts if p[2] is not None]
+    gain_ft = 0.0
+    if len(eles) >= 2:
+        win = 5
+        smooth = [
+            sum(eles[max(0, i - win // 2): i + win // 2 + 1])
+            / len(eles[max(0, i - win // 2): i + win // 2 + 1])
+            for i in range(len(eles))
+        ]
+        gain_m = sum(max(0.0, b - a) for a, b in zip(smooth, smooth[1:]))
+        gain_ft = gain_m * 3.28084
+
+    start = None
+    for p in pts:
+        if p[3]:
+            start = datetime.fromisoformat(p[3].replace("Z", "+00:00")).astimezone(tz)
+            break
+    return {"distance_mi": distance, "gain_ft": gain_ft, "start": start}
+
+
 def parse_hhmm(text):
     hh, mm = text.split(":")
     return time(int(hh), int(mm))
@@ -108,8 +177,9 @@ def main():
     p = argparse.ArgumentParser(
         description="Work out the latest you can start a ride and still be home by curfew."
     )
-    p.add_argument("--distance", type=float, required=True, help="Ride distance in miles")
-    p.add_argument("--gain", type=float, default=0, help="Elevation gain in feet")
+    p.add_argument("--distance", type=float, default=None, help="Ride distance in miles (or use --gpx)")
+    p.add_argument("--gain", type=float, default=None, help="Elevation gain in feet (or use --gpx)")
+    p.add_argument("--gpx", default=None, help="GPX file to read distance, gain, date and start time from")
     p.add_argument("--speed", type=float, default=15.0, help="Average flat speed in mph (default 15)")
     p.add_argument("--climb-rate", type=float, default=1.0, help="Extra minutes per 100 ft of climbing (default 1.0)")
     p.add_argument("--stops", type=float, default=0, help="Minutes of stopped time (default 0)")
@@ -123,6 +193,23 @@ def main():
     args = p.parse_args()
 
     tz = ZoneInfo(args.tz)
+
+    gpx_info = None
+    if args.gpx:
+        gpx_info = parse_gpx(args.gpx, tz)
+        if args.distance is None:
+            args.distance = gpx_info["distance_mi"]
+        if args.gain is None:
+            args.gain = gpx_info["gain_ft"]
+        if args.date is None and gpx_info["start"] is not None:
+            args.date = gpx_info["start"].strftime("%Y-%m-%d")
+        if args.leave is None and gpx_info["start"] is not None:
+            args.leave = gpx_info["start"].strftime("%H:%M")
+    if args.distance is None:
+        p.error("give a --distance, or a --gpx file to read it from")
+    if args.gain is None:
+        args.gain = 0
+
     start_day = (
         datetime.strptime(args.date, "%Y-%m-%d").date()
         if args.date
@@ -130,7 +217,7 @@ def main():
     )
 
     if args.week:
-        print(f"Ride: {args.distance:g} mi, {args.gain:g} ft, curfew {args.curfew}")
+        print(f"Ride: {args.distance:.1f} mi, {args.gain:.0f} ft, curfew {args.curfew}")
         print(f"{'Date':<14}{'Sunset':<10}{'Latest start':<14}Ride time")
         for i in range(7):
             day = start_day + timedelta(days=i)
@@ -142,7 +229,15 @@ def main():
         return
 
     curfew, sunset, dur, latest = plan_for_day(start_day, args, tz)
-    print(f"Ride:        {args.distance:g} mi, {args.gain:g} ft climbing")
+    if gpx_info is not None:
+        gpx_line = (
+            f"From GPX:    {gpx_info['distance_mi']:.2f} mi, "
+            f"{gpx_info['gain_ft']:.0f} ft gain"
+        )
+        if gpx_info["start"] is not None:
+            gpx_line += f", started {fmt(gpx_info['start'])}"
+        print(gpx_line)
+    print(f"Ride:        {args.distance:.1f} mi, {args.gain:.0f} ft climbing")
     print(f"Ride time:   ~{fmt_duration(dur)} (est, slightly conservative)")
     print(f"Sunset:      {fmt(sunset)} on {start_day.strftime('%a %b %-d')}")
     print(f"Curfew:      {fmt(curfew)}")
